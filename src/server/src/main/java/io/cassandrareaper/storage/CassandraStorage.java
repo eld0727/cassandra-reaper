@@ -41,6 +41,7 @@ import io.cassandrareaper.service.RingRange;
 import io.cassandrareaper.storage.cassandra.DateTimeCodec;
 import io.cassandrareaper.storage.cassandra.Migration016;
 import io.cassandrareaper.storage.cassandra.Migration021;
+import io.cassandrareaper.storage.cassandra.Migration025;
 
 import java.io.IOException;
 import java.math.BigInteger;
@@ -163,6 +164,8 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
   @Nullable // null on Cassandra-2 as it's not supported syntax
   private PreparedStatement getRepairSegmentsByRunIdAndStatePrepStmt = null;
   @Nullable // null on Cassandra-2 as it's not supported syntax
+  private PreparedStatement getRepairSegmentsByRunIdWithStartedOrRunningStatePrepStmt = null;
+  @Nullable // null on Cassandra-2 as it's not supported syntax
   private PreparedStatement getRepairSegmentCountByRunIdAndStatePrepStmt = null;
   private PreparedStatement insertRepairSchedulePrepStmt;
   private PreparedStatement getRepairSchedulePrepStmt;
@@ -270,6 +273,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
         Migration016.migrate(session, config.getCassandraFactory().getKeyspace());
         // Switch metrics table to TWCS if possible, this is intentionally executed every startup
         Migration021.migrate(session, config.getCassandraFactory().getKeyspace());
+        Migration025.migrate(session, config.getCassandraFactory().getKeyspace());
       } else {
         LOG.info(
             String.format("Keyspace %s already at schema version %d", session.getLoggedKeyspace(), currentVersion));
@@ -362,19 +366,21 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
     insertRepairSegmentPrepStmt = session
         .prepare(
             "INSERT INTO repair_run"
-                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_state,fail_count, token_ranges)"
+                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_active,segment_state,"
+                + "fail_count,token_ranges)"
                 + " VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     insertRepairSegmentIncrementalPrepStmt = session
         .prepare(
             "INSERT INTO repair_run"
-                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_state,coordinator_host,fail_count)"
+                + "(id,segment_id,repair_unit_id,start_token,end_token,segment_active,segment_state,"
+                + "coordinator_host,fail_count)"
                 + " VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     updateRepairSegmentPrepStmt = session
         .prepare(
             "INSERT INTO repair_run"
-                + "(id,segment_id,segment_state,coordinator_host,segment_start_time,fail_count)"
+                + "(id,segment_id,segment_active,segment_state,coordinator_host,segment_start_time,fail_count)"
                 + " VALUES(?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     insertRepairSegmentEndTimePrepStmt = session
@@ -441,6 +447,11 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
             "SELECT id,repair_unit_id,segment_id,start_token,end_token,segment_state,coordinator_host,"
                 + "segment_start_time,segment_end_time,fail_count, token_ranges FROM repair_run "
                 + "WHERE id = ? AND segment_state = ? ALLOW FILTERING");
+        getRepairSegmentsByRunIdWithStartedOrRunningStatePrepStmt = session.prepare(
+            "SELECT id,repair_unit_id,segment_id,start_token,end_token,segment_state,coordinator_host,"
+                + "segment_start_time,segment_end_time,fail_count, token_ranges FROM repair_run "
+                + "WHERE id = ? AND segment_active = true ALLOW FILTERING")
+            .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
         getRepairSegmentCountByRunIdAndStatePrepStmt = session.prepare(
             "SELECT count(segment_id) FROM repair_run WHERE id = ? AND segment_state = ? ALLOW FILTERING");
       } catch (InvalidQueryException ex) {
@@ -676,6 +687,10 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
       assert 0 == segment.getFailCount();
       assert (null != segment.getCoordinatorHost()) == isIncremental;
 
+      boolean segmentActive
+          = RepairSegment.State.STARTED == segment.getState()
+              || RepairSegment.State.RUNNING == segment.getState();
+
       if (isIncremental) {
         repairRunBatch.add(
             insertRepairSegmentIncrementalPrepStmt.bind(
@@ -684,6 +699,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
               segment.getRepairUnitId(),
               segment.getStartToken(),
               segment.getEndToken(),
+              segmentActive,
               segment.getState().ordinal(),
               segment.getCoordinatorHost(),
               segment.getFailCount()));
@@ -696,6 +712,7 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
                   segment.getRepairUnitId(),
                   segment.getStartToken(),
                   segment.getEndToken(),
+                  segmentActive,
                   segment.getState().ordinal(),
                   segment.getFailCount(),
                   objectMapper.writeValueAsString(segment.getTokenRange().getTokenRanges())));
@@ -952,12 +969,17 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
           && getRepairUnit(segment.getRepairUnitId()).getIncrementalRepair())
         : "non-leader trying to update repair segment " + segment.getId() + " of run " + segment.getRunId();
 
+    boolean segmentActive
+        = RepairSegment.State.STARTED == segment.getState()
+            || RepairSegment.State.RUNNING == segment.getState();
+
     BatchStatement updateRepairSegmentBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
 
     updateRepairSegmentBatch.add(
         updateRepairSegmentPrepStmt.bind(
             segment.getRunId(),
             segment.getId(),
+            segmentActive,
             segment.getState().ordinal(),
             segment.getCoordinatorHost(),
             segment.hasStartTime() ? segment.getStartTime().toDate() : null,
@@ -1109,6 +1131,30 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
         segments.add(createRepairSegmentFromRow(segmentRow));
       }
     }
+    return segments;
+  }
+
+  @Override
+  public Collection<RepairSegment> getSegmentsWithStartedOrRunningState(UUID runId) {
+    Collection<RepairSegment> segments = Lists.newArrayList();
+
+    if (getRepairSegmentsByRunIdWithStartedOrRunningStatePrepStmt != null) {
+      Statement statement = getRepairSegmentsByRunIdWithStartedOrRunningStatePrepStmt.bind(runId);
+      for (Row segmentRow : session.execute(statement)) {
+        segments.add(createRepairSegmentFromRow(segmentRow));
+      }
+    } else {
+      Statement statement = getRepairSegmentsByRunIdPrepStmt.bind(runId)
+          .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
+      for (Row segmentRow : session.execute(statement)) {
+        int segmentState = segmentRow.getInt("segment_state");
+        if (segmentState == RepairSegment.State.STARTED.ordinal()
+            || segmentState == RepairSegment.State.RUNNING.ordinal()) {
+          segments.add(createRepairSegmentFromRow(segmentRow));
+        }
+      }
+    }
+
     return segments;
   }
 
