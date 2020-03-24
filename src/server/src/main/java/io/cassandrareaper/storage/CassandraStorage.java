@@ -370,20 +370,20 @@ public final class CassandraStorage implements IStorage, IDistributedStorage {
             "INSERT INTO repair_run"
                 + "(id,segment_id,repair_unit_id,start_token,end_token,segment_active,segment_state,"
                 + "fail_count,token_ranges)"
-                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
+                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     insertRepairSegmentIncrementalPrepStmt = session
         .prepare(
             "INSERT INTO repair_run"
                 + "(id,segment_id,repair_unit_id,start_token,end_token,segment_active,segment_state,"
                 + "coordinator_host,fail_count)"
-                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
+                + " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     updateRepairSegmentPrepStmt = session
         .prepare(
             "INSERT INTO repair_run"
                 + "(id,segment_id,segment_active,segment_state,coordinator_host,segment_start_time,fail_count)"
-                + " VALUES(?, ?, ?, ?, ?, ?)")
+                + " VALUES(?, ?, ?, ?, ?, ?, ?)")
         .setConsistencyLevel(ConsistencyLevel.LOCAL_QUORUM);
     insertRepairSegmentEndTimePrepStmt = session
         .prepare("INSERT INTO repair_run(id, segment_id, segment_end_time) VALUES(?, ?, ?)")
